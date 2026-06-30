@@ -331,12 +331,22 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (!response.ok) throw new Error(`خطأ من الخادم: ${response.status}`);
                 const result = await response.json();
                 
-                // Deep copy alignments for reset functionality
-                if (result.data) {
-                    originalAlignments = JSON.parse(JSON.stringify(result.data));
+                if (result.status === 'success') {
+                    // In case it finishes immediately
+                    if (result.data) {
+                        originalAlignments = JSON.parse(JSON.stringify(result.data));
+                    }
+                    handleMunajjamSuccess(result);
+                } else if (result.status === 'queued' || result.status === 'processing') {
+                    // Start polling
+                    pollMunajjamStatus(result.job_id, apiUrl, surahId);
+                } else {
+                    // Fallback to old synchronous behavior if status is not present
+                    if (result.data) {
+                        originalAlignments = JSON.parse(JSON.stringify(result.data));
+                    }
+                    handleMunajjamSuccess(result);
                 }
-
-                handleMunajjamSuccess(result);
 
             } else {
                 // CTC or Whisper Cloud
@@ -540,6 +550,35 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (error) {
             console.warn('Polling error (retrying...):', error);
             setTimeout(() => pollCloudStatus(jobId, apiUrl, startTime), 5000);
+        }
+    }
+
+    async function pollMunajjamStatus(jobId, apiUrl, surahId, startTime = Date.now()) {
+        try {
+            const response = await fetch(`${apiUrl}/align/status/${jobId}`, {
+                headers: { 'Bypass-Tunnel-Reminder': 'true' }
+            });
+            const result = await response.json();
+            
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            
+            if (result.status === 'success') {
+                // Munajjam returns the result in "data" instead of "alignments"
+                if (result.data) {
+                    originalAlignments = JSON.parse(JSON.stringify(result.data));
+                }
+                handleMunajjamSuccess(result);
+            } else if (result.status === 'error') {
+                alert('خطأ في معالجة منجم: ' + result.message);
+                loadingOverlay.classList.add('hidden');
+            } else {
+                loadingTitle.textContent = 'جاري المزامنة عبر منجم...';
+                loadingDesc.textContent = `المهمة قيد التنفيذ، يرجى الانتظار... (${elapsed} ثانية)`;
+                setTimeout(() => pollMunajjamStatus(jobId, apiUrl, surahId, startTime), 3000);
+            }
+        } catch (error) {
+            console.warn('Polling error (retrying...):', error);
+            setTimeout(() => pollMunajjamStatus(jobId, apiUrl, surahId, startTime), 5000);
         }
     }
 
@@ -1030,9 +1069,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const colabCodes = {
         munajjam: [
-            `# الخلية الأولى: إعداد البيئة وتثبيت المكتبات\n# 1. تحميل المشروع من جديد\n!rm -rf munajjam\n!git clone https://github.com/alinice1998/Munajjam.git\n\n# 2. الدخول للمجلد المتداخل الذي يحتوي على ملفات التثبيت\n%cd /content/Munajjam/munajjam\n\n# 3. التثبيت (تم إزالة localtunnel)\n!pip install "numpy<2"\n!pip install ".[faster-whisper]" fastapi uvicorn python-multipart`,
-            `# الخلية الثانية: إنشاء ملف الخادم (يجب أن يكون %%writefile في أول سطر بالخلية)\n%%writefile api.py\nfrom fastapi import FastAPI, UploadFile, File, Form\nfrom fastapi.middleware.cors import CORSMiddleware\nfrom munajjam.transcription.whisperFactory import WhisperFactory, WhisperBackend\nfrom munajjam.core import align\nfrom munajjam.data import load_surah_ayahs\nimport shutil\nimport os\n\napp = FastAPI()\n\napp.add_middleware(\n    CORSMiddleware,\n    allow_origins=["*"],\n    allow_credentials=True,\n    allow_methods=["*"],\n    allow_headers=["*"],\n)\n\n@app.post("/align/{surah_number}")\nasync def align_audio(surah_number: int, file: UploadFile = File(...), riwaya: str = Form("hafs")):\n    file_location = f"{surah_number}.mp3"\n    with open(file_location, "wb") as buffer:\n        shutil.copyfileobj(file.file, buffer)\n\n    # Use the new Whisperx Hybrid Engine\n    transcriber = WhisperFactory().create_whisper(backend=WhisperBackend.WHISPERX, model_name="large-v2")\n    segments = transcriber.transcribe(file_location, surah_id=surah_number)\n\n    ayahs = load_surah_ayahs(surah_number, riwaya=riwaya)\n    results = align(file_location, segments, ayahs, strategy="hybrid")\n\n    response_data = []\n    for result in results:\n        ayah_data = {\n            "ayah_number": result.ayah.ayah_number,\n            "start_time": result.start_time,\n            "end_time": result.end_time\n        }\n        if getattr(result, "words", None):\n            ayah_data["words"] = [{"word": w.word, "start": w.start, "end": w.end} for w in result.words]\n        response_data.append(ayah_data)\n\n    os.remove(file_location)\n    return {"surah": surah_number, "data": response_data}`,
-            `# الخلية الثالثة: تشغيل الخادم والحصول على الرابط عبر Cloudflare\nimport subprocess, threading, time, re\n\n# تحميل أداة cloudflared\nsubprocess.run([\n    "wget", "-q",\n    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",\n    "-O", "cloudflared"\n], check=True)\nsubprocess.run(["chmod", "+x", "cloudflared"], check=True)\n\n# تشغيل خادم uvicorn في الخلفية (تم تعديله ليعمل مع api:app)\nuvicorn_proc = subprocess.Popen(\n    ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"],\n    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True\n)\nprint("⏳ جاري تشغيل خادم Uvicorn (يرجى الانتظار 10 ثوانٍ)...")\ntime.sleep(10)  # مهلة لضمان بدء الخادم\n\n# تشغيل cloudflared والتقاط الرابط\ncf_proc = subprocess.Popen(\n    ["./cloudflared", "tunnel", "--url", "http://localhost:8000"],\n    stderr=subprocess.PIPE, text=True\n)\n\nprint("⏳ جاري الاتصال بـ Cloudflare Tunnel...")\nurl = None\nfor line in cf_proc.stderr:\n    match = re.search(r'https://[a-z0-9\\-]+\\.trycloudflare\\.com', line)\n    if match:\n        url = match.group(0)\n        print(f"\\n✅ الرابط العام جاهز:\\n🌐 {url}\\n")\n        print("📌 انسخ هذا الرابط واستخدمه في التطبيق الخاص بك")\n        print("⚠️  لا توجد كلمة مرور - فقط انسخ الرابط مباشرة")\n        break\n\n# إبقاء الخلية تعمل وعرض التحديثات لمنع توقف كولاب\nprint("\\n🔥 الخادم يعمل الآن. سيتم عرض التحديثات أدناه...\\n")\nfor line in uvicorn_proc.stdout:\n    print(line, end="")`
+            `# الخلية الأولى: إعداد البيئة وتثبيت المكتبات\n# 1. تحميل المشروع من جديد\n!rm -rf munajjam-backend\n# يرجى استبدال الرابط برابط المستودع الخاص بك بعد رفع التعديلات\n!git clone https://github.com/alinice1998/munajjam-backend.git\n\n# 2. الدخول للمجلد\n%cd munajjam-backend/munajjam\n\n# 3. التثبيت\n!apt-get install -y ffmpeg\n!pip install -e ".[api]"\n!pip install git+https://github.com/m-bain/whisperx.git faster-whisper`,
+            `# الخلية الثانية: تشغيل الخادم والحصول على الرابط عبر Cloudflare\nimport subprocess, threading, time, re\n\n# تحميل أداة cloudflared\nsubprocess.run([\n    "wget", "-q",\n    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",\n    "-O", "cloudflared"\n], check=True)\nsubprocess.run(["chmod", "+x", "cloudflared"], check=True)\n\n# الرجوع للمجلد الرئيسي لتشغيل الخادم\n%cd /content/munajjam-backend\n\n# تشغيل خادم uvicorn في الخلفية\nuvicorn_proc = subprocess.Popen(\n    ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"],\n    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True\n)\nprint("⏳ جاري تشغيل خادم Uvicorn (يرجى الانتظار 10 ثوانٍ)...")\ntime.sleep(10)\n\n# تشغيل cloudflared والتقاط الرابط\ncf_proc = subprocess.Popen(\n    ["./cloudflared", "tunnel", "--url", "http://localhost:8000"],\n    stderr=subprocess.PIPE, text=True\n)\n\nprint("⏳ جاري الاتصال بـ Cloudflare Tunnel...")\nurl = None\nfor line in cf_proc.stderr:\n    match = re.search(r'https://[a-z0-9\\-]+\\.trycloudflare\\.com', line)\n    if match:\n        url = match.group(0)\n        print(f"\\n✅ الرابط العام جاهز:\\n🌐 {url}\\n")\n        print("📌 انسخ هذا الرابط واستخدمه في التطبيق الخاص بك")\n        print("⚠️  لا توجد كلمة مرور - فقط انسخ الرابط مباشرة")\n        break\n\n# إبقاء الخلية تعمل وعرض التحديثات\nprint("\\n🔥 الخادم يعمل الآن. سيتم عرض التحديثات أدناه...\\n")\nfor line in uvicorn_proc.stdout:\n    print(line, end="")`
         ],
         hybrid: [
             `# 1. إعداد المشروع وتشغيل خادم المزامنة الهجينة (Hybrid)\n!rm -rf colabwis\n!git clone https://github.com/alinice1998/colabwis.git\n%cd colabwis\n\n!apt-get install -y ffmpeg\n!pip uninstall -y numpy ctc-segmentation\n!pip install git+https://github.com/m-bain/whisperx.git\n!pip install -r requirements.txt\n!pip install "numpy<2"\n!pip install --no-cache-dir rapidfuzz ctc-segmentation\n!python model_downloader.py\n\nimport subprocess, threading, time, re\n\n# تحميل cloudflared\nsubprocess.run(["wget", "-q", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", "-O", "cloudflared"], check=True)\nsubprocess.run(["chmod", "+x", "cloudflared"], check=True)\n\n# تشغيل الخادم\nuvicorn_proc = subprocess.Popen(["uvicorn", "colab_server:app", "--host", "0.0.0.0", "--port", "8000"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\nprint("⏳ جاري تشغيل الخادم (قد يستغرق تحميل النماذج 15-20 ثانية)...")\ntime.sleep(15)\n\n# تشغيل النفق والتقاط الرابط\ncf_proc = subprocess.Popen(["./cloudflared", "tunnel", "--url", "http://localhost:8000"], stderr=subprocess.PIPE, text=True)\n\nfor line in cf_proc.stderr:\n    match = re.search(r'https://[a-z0-9\\-]+\\.trycloudflare\\.com', line)\n    if match:\n        print(f"\\n✅ الرابط العام جاهز:\\n🌐 {match.group(0)}\\n")\n        break\n\nfor line in uvicorn_proc.stdout: print(line, end="")`
