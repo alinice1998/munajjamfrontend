@@ -10,6 +10,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const methodSelect = document.getElementById('method-select');
     const ayahIdInput = document.getElementById('ayah-id');
     const apiUrlInput = document.getElementById('api-url');
+    const chunkDurationInput = document.getElementById('chunk-duration');
+    const minSilenceMsInput = document.getElementById('min-silence-ms');
+    const minSpeechMsInput = document.getElementById('min-speech-ms');
+    const padMsInput = document.getElementById('pad-ms');
+    const repetitionAttachInput = document.getElementById('repetition-attach');
     const uploadZone = document.getElementById('upload-zone');
     const audioUpload = document.getElementById('audio-upload');
     const processBtn = document.getElementById('process-btn');
@@ -60,6 +65,8 @@ document.addEventListener('DOMContentLoaded', () => {
     let wavesurfer;
     let alignments = [];
     let originalAlignments = [];
+    let breathGroups = [];
+    let ayahMetadata = [];
     let surahData = [];
     let quranData = { hafsh: null, warsh: null };
     let customReferenceText = null;
@@ -318,11 +325,22 @@ document.addEventListener('DOMContentLoaded', () => {
                 loadingTitle.textContent = 'جاري المزامنة عبر منجم...';
                 loadingDesc.textContent = 'يتم الآن تحليل الآيات على الخادم السحابي...';
 
+                const chunkDuration = parseFloat(chunkDurationInput.value);
+                const minSilenceMs = parseInt(minSilenceMsInput.value, 10);
+                const minSpeechMs = parseInt(minSpeechMsInput.value, 10);
+                const padMs = parseInt(padMsInput.value, 10);
+
                 const formData = new FormData();
                 formData.append('file', file);
+                formData.append('method', 'hybrid');
                 formData.append('riwaya', recitation);
+                formData.append('chunk_duration', Number.isFinite(chunkDuration) ? chunkDuration : 30.0);
+                formData.append('min_silence_ms', Number.isFinite(minSilenceMs) ? minSilenceMs : 300);
+                formData.append('min_speech_ms', Number.isFinite(minSpeechMs) ? minSpeechMs : 100);
+                formData.append('pad_ms', Number.isFinite(padMs) ? padMs : 100);
+                formData.append('repetition_attach', repetitionAttachInput.checked ? 'true' : 'false');
 
-                const response = await fetch(`${apiUrl}/align/${surahId}`, {
+                const response = await fetch(`${apiUrl}/align/job/${surahId}`, {
                     method: 'POST',
                     headers: { 'Bypass-Tunnel-Reminder': 'true' },
                     body: formData
@@ -487,12 +505,28 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function handleMunajjamSuccess(result) {
+        // Preserve breath_groups from response
+        if (Array.isArray(result.breath_groups)) {
+            breathGroups = JSON.parse(JSON.stringify(result.breath_groups));
+        } else {
+            breathGroups = [];
+        }
+
         // Check if words exist
         const hasWords = result.data.some(d => d.words && d.words.length > 0);
         
         if (hasWords) {
             let flatAlignments = [];
+            ayahMetadata = [];
             result.data.forEach(ayahData => {
+                // Preserve ayah-level metadata
+                const meta = {
+                    ayah_number: ayahData.ayah_number,
+                    pause_duration: ayahData.pause_duration ?? null,
+                    is_breath_boundary: ayahData.is_breath_boundary ?? false
+                };
+                ayahMetadata.push(meta);
+
                 if (ayahData.words) {
                     ayahData.words.forEach(w => {
                         flatAlignments.push({ word: w.word, start: w.start, end: w.end });
@@ -505,6 +539,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         let newAlignments = [];
+        ayahMetadata = [];
         const ayahsEl = Array.from(document.querySelectorAll('.quran-ayah'));
         
         ayahsEl.forEach(ayahEl => {
@@ -515,6 +550,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     start: ayahData.start_time,
                     end: ayahData.end_time,
                     element: ayahEl
+                });
+                ayahMetadata.push({
+                    ayah_number: ayahData.ayah_number,
+                    pause_duration: ayahData.pause_duration ?? null,
+                    is_breath_boundary: ayahData.is_breath_boundary ?? false
                 });
             }
         });
@@ -561,8 +601,12 @@ document.addEventListener('DOMContentLoaded', () => {
             const result = await response.json();
             
             const elapsed = Math.round((Date.now() - startTime) / 1000);
+            const progressBar = document.getElementById('loading-progress-bar');
             
             if (result.status === 'success') {
+                if (progressBar) {
+                    progressBar.style.width = '100%';
+                }
                 // Munajjam returns the result in "data" instead of "alignments"
                 if (result.data) {
                     originalAlignments = JSON.parse(JSON.stringify(result.data));
@@ -573,7 +617,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 loadingOverlay.classList.add('hidden');
             } else {
                 loadingTitle.textContent = 'جاري المزامنة عبر منجم...';
-                loadingDesc.textContent = `المهمة قيد التنفيذ، يرجى الانتظار... (${elapsed} ثانية)`;
+                const message = (result.message && typeof result.message === 'string' && result.message.trim())
+                    ? result.message
+                    : `المهمة قيد التنفيذ، يرجى الانتظار... (${elapsed} ثانية)`;
+                loadingDesc.textContent = message;
+
+                const progress = Number.isFinite(result.progress) ? Math.max(0, Math.min(100, result.progress)) : 0;
+                if (progressBar) {
+                    progressBar.style.width = `${progress}%`;
+                    progressBar.classList.remove('animate-[loading_2s_ease-in-out_infinite]');
+                }
+
                 setTimeout(() => pollMunajjamStatus(jobId, apiUrl, surahId, startTime), 3000);
             }
         } catch (error) {
@@ -1073,7 +1127,8 @@ document.addEventListener('DOMContentLoaded', () => {
             `# الخلية الثانية: تشغيل الخادم والحصول على الرابط عبر Cloudflare\n# الرجوع للمجلد الرئيسي لتشغيل الخادم\n%cd /content/munajjam-backend\n\nimport subprocess, threading, time, re, os\n\n# تنظيف أي عمليات سابقة (مفيد عند إعادة تشغيل الخلية لمنع خطأ Port already in use)\nos.system("pkill -f uvicorn || true")\nos.system("pkill -f cloudflared || true")\ntime.sleep(2)\n\n# تحميل أداة cloudflared\nsubprocess.run([\n    "wget", "-q",\n    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",\n    "-O", "cloudflared"\n], check=True)\nsubprocess.run(["chmod", "+x", "cloudflared"], check=True)\n\n# تشغيل خادم uvicorn في الخلفية\nuvicorn_proc = subprocess.Popen(\n    ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"],\n    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True\n)\nprint("⏳ جاري تشغيل خادم Uvicorn (يرجى الانتظار 10 ثوانٍ)...")\ntime.sleep(10)\n\n# تشغيل cloudflared والتقاط الرابط\ncf_proc = subprocess.Popen(\n    ["./cloudflared", "tunnel", "--url", "http://localhost:8000"],\n    stderr=subprocess.PIPE, text=True\n)\n\nprint("⏳ جاري الاتصال بـ Cloudflare Tunnel...")\nurl = None\nfor line in cf_proc.stderr:\n    match = re.search(r'https://[a-z0-9\\-]+\\.trycloudflare\\.com', line)\n    if match:\n        url = match.group(0)\n        print(f"\\n✅ الرابط العام جاهز:\\n🌐 {url}\\n")\n        print("📌 انسخ هذا الرابط واستخدمه في التطبيق الخاص بك")\n        print("⚠️  لا توجد كلمة مرور - فقط انسخ الرابط مباشرة")\n        break\n\n# إبقاء الخلية تعمل وعرض التحديثات\nprint("\\n🔥 الخادم يعمل الآن. سيتم عرض التحديثات أدناه...\\n")\nfor line in uvicorn_proc.stdout:\n    print(line, end="")`
         ],
         hybrid: [
-            `# 1. إعداد المشروع وتشغيل خادم المزامنة الهجينة (Hybrid)\n!rm -rf colabwis\n!git clone https://github.com/alinice1998/colabwis.git\n%cd colabwis\n\n!apt-get install -y ffmpeg\n!pip uninstall -y numpy ctc-segmentation\n!pip install git+https://github.com/m-bain/whisperx.git\n!pip install -r requirements.txt\n!pip install "numpy<2"\n!pip install --no-cache-dir rapidfuzz ctc-segmentation\n!python model_downloader.py\n\nimport subprocess, threading, time, re\n\n# تحميل cloudflared\nsubprocess.run(["wget", "-q", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", "-O", "cloudflared"], check=True)\nsubprocess.run(["chmod", "+x", "cloudflared"], check=True)\n\n# تشغيل الخادم\nuvicorn_proc = subprocess.Popen(["uvicorn", "colab_server:app", "--host", "0.0.0.0", "--port", "8000"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\nprint("⏳ جاري تشغيل الخادم (قد يستغرق تحميل النماذج 15-20 ثانية)...")\ntime.sleep(15)\n\n# تشغيل النفق والتقاط الرابط\ncf_proc = subprocess.Popen(["./cloudflared", "tunnel", "--url", "http://localhost:8000"], stderr=subprocess.PIPE, text=True)\n\nfor line in cf_proc.stderr:\n    match = re.search(r'https://[a-z0-9\\-]+\\.trycloudflare\\.com', line)\n    if match:\n        print(f"\\n✅ الرابط العام جاهز:\\n🌐 {match.group(0)}\\n")\n        break\n\nfor line in uvicorn_proc.stdout: print(line, end="")`
+            `# الخلية الأولى: إعداد البيئة وتثبيت المتطلبات\n# 1. تثبيت حزم النظام المطلوبة\n!apt-get update && apt-get install -y ffmpeg libsndfile1 gcc g++ git\n\n# 2. استنساخ مستودع Munajjam الرسمي\n!rm -rf Munajjam\n!git clone https://github.com/Itqan-community/Munajjam.git\n%cd Munajjam\n\n# 3. تثبيت متطلبات Python\n# تثبيت حزمة Munajjam مع تبعيات API\n!pip install -e ".[api]"\n# تثبيت faster-whisper للنموذج العربي\n!pip install faster-whisper\n# تثبيت WhisperX من المصدر\n!pip install git+https://github.com/m-bain/whisperx.git\n\n# 4. إنشاء مجلدات النماذج والملفات المؤقتة\n!mkdir -p model_local/whisper model_local/whisperx temp_audio\n\n# ملاحظة: النماذج ستُحمل تلقائياً عند أول استخدام:\n# - Faster-Whisper: OdyAsh/faster-whisper-base-ar-quran\n# - WhisperX: large-v2\n# - Wav2Vec2: jonatasgrosman/wav2vec2-large-xlsr-53-arabic\n# لا حاجة لتشغيل model_downloader.py`,
+            `# الخلية الثانية: تشغيل الخادم والحصول على الرابط عبر Cloudflare\nimport subprocess, threading, time, re, os\n\n# تنظيف أي عمليات سابقة (مفيد عند إعادة تشغيل الخلية لمنع خطأ Port already in use)\nos.system("pkill -f uvicorn || true")\nos.system("pkill -f cloudflared || true")\ntime.sleep(2)\n\n# تحميل أداة cloudflared من الإصدار الرسمي\nsubprocess.run([\n    "wget", "-q",\n    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",\n    "-O", "cloudflared"\n], check=True)\nsubprocess.run(["chmod", "+x", "cloudflared"], check=True)\n\n# تشغيل خادم uvicorn في الخلفية\nuvicorn_proc = subprocess.Popen(\n    ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"],\n    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True\n)\nprint("⏳ جاري تشغيل خادم Uvicorn (يرجى الانتظار 20-30 ثانية لتحميل النماذج)...")\ntime.sleep(25)\n\n# تشغيل cloudflared والتقاط الرابط\ncf_proc = subprocess.Popen(\n    ["./cloudflared", "tunnel", "--url", "http://localhost:8000"],\n    stderr=subprocess.PIPE, text=True\n)\n\nprint("⏳ جاري الاتصال بـ Cloudflare Tunnel...")\nurl = None\nfor line in cf_proc.stderr:\n    match = re.search(r'https://[a-z0-9\\-]+\\.trycloudflare\\.com', line)\n    if match:\n        url = match.group(0)\n        print(f"\\n✅ الرابط العام جاهز:\\n🌐 {url}\\n")\n        print("📌 انسخ هذا الرابط واستخدمه في التطبيق الخاص بك")\n        print("⚠️  لا توجد كلمة مرور - فقط انسخ الرابط مباشرة")\n        break\n\n# إبقاء الخلية تعمل وعرض التحديثات\nprint("\\n🔥 الخادم يعمل الآن. سيتم عرض التحديثات أدناه...\\n")\nfor line in uvicorn_proc.stdout:\n    print(line, end="")`
         ],
         ctc_cloud: [
             `# 1. إعداد المشروع وتشغيل خادم CTC\n!rm -rf colabwis\n!git clone https://github.com/alinice1998/colabwis.git\n%cd colabwis\n\n!apt-get install -y ffmpeg\n!pip uninstall -y numpy ctc-segmentation\n!pip install "numpy<2"\n!pip install rapidfuzz ctc-segmentation\n!pip install -r requirements.txt\n!pip install git+https://github.com/m-bain/whisperx.git\n!python model_downloader.py\n\nimport subprocess, threading, time, re\n\n# تحميل cloudflared\nsubprocess.run(["wget", "-q", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", "-O", "cloudflared"], check=True)\nsubprocess.run(["chmod", "+x", "cloudflared"], check=True)\n\n# تشغيل الخادم\nuvicorn_proc = subprocess.Popen(["uvicorn", "colab_server:app", "--host", "0.0.0.0", "--port", "8000"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\nprint("⏳ جاري تشغيل الخادم...")\ntime.sleep(15)\n\n# تشغيل النفق\ncf_proc = subprocess.Popen(["./cloudflared", "tunnel", "--url", "http://localhost:8000"], stderr=subprocess.PIPE, text=True)\n\nfor line in cf_proc.stderr:\n    match = re.search(r'https://[a-z0-9\\-]+\\.trycloudflare\\.com', line)\n    if match:\n        print(f"\\n✅ الرابط العام جاهز:\\n🌐 {match.group(0)}\\n")\n        break\n\nfor line in uvicorn_proc.stdout: print(line, end="")`
