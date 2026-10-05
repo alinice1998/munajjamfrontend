@@ -319,26 +319,32 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         loadingOverlay.classList.remove('hidden');
+        const progressBar = document.getElementById('loading-progress-bar');
+        if (progressBar) {
+            progressBar.style.width = '0%';
+            progressBar.classList.add('animate-[loading_2s_ease-in-out_infinite]');
+        }
 
         try {
             if (method === 'munajjam') {
                 loadingTitle.textContent = 'جاري المزامنة عبر منجم...';
                 loadingDesc.textContent = 'يتم الآن تحليل الآيات على الخادم السحابي...';
 
-                const chunkDuration = parseFloat(chunkDurationInput.value);
-                const minSilenceMs = parseInt(minSilenceMsInput.value, 10);
-                const minSpeechMs = parseInt(minSpeechMsInput.value, 10);
-                const padMs = parseInt(padMsInput.value, 10);
+                const chunkDuration = parseFloat(chunkDurationInput?.value);
+                const minSilenceMs = parseInt(minSilenceMsInput?.value, 10);
+                const minSpeechMs = parseInt(minSpeechMsInput?.value, 10);
+                const padMs = parseInt(padMsInput?.value, 10);
 
                 const formData = new FormData();
                 formData.append('file', file);
                 formData.append('method', 'hybrid');
-                formData.append('riwaya', recitation);
+                const mappedRiwaya = (recitation === 'hafsh') ? 'hafs' : recitation;
+                formData.append('riwaya', mappedRiwaya);
                 formData.append('chunk_duration', Number.isFinite(chunkDuration) ? chunkDuration : 30.0);
                 formData.append('min_silence_ms', Number.isFinite(minSilenceMs) ? minSilenceMs : 300);
                 formData.append('min_speech_ms', Number.isFinite(minSpeechMs) ? minSpeechMs : 100);
                 formData.append('pad_ms', Number.isFinite(padMs) ? padMs : 100);
-                formData.append('repetition_attach', repetitionAttachInput.checked ? 'true' : 'false');
+                formData.append('repetition_attach', (repetitionAttachInput && repetitionAttachInput.checked) ? 'true' : 'false');
 
                 const response = await fetch(`${apiUrl}/align/job/${surahId}`, {
                     method: 'POST',
@@ -1135,6 +1141,7 @@ document.addEventListener('DOMContentLoaded', () => {
         ],
         whisperx: []
     };
+    colabCodes.munajjam = colabCodes.hybrid; // Munajjam uses the official hybrid server script
     colabCodes.whisperx = colabCodes.hybrid; // WhisperX also uses the hybrid script as it contains WhisperX functionality
 
 
